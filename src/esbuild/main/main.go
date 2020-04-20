@@ -24,6 +24,7 @@ type args struct {
 	cpuprofileFile string
 	parseOptions   parser.ParseOptions
 	bundleOptions  bundler.BundleOptions
+	resolveOptions resolver.ResolveOptions
 	logOptions     logging.StderrOptions
 	entryPaths     []string
 }
@@ -54,7 +55,7 @@ func (args *args) parseDefine(key string, value string) bool {
 	// Parse the value as JSON
 	log, done := logging.NewDeferLog()
 	source := logging.Source{Contents: value}
-	expr, ok := parser.ParseJson(log, source)
+	expr, ok := parser.ParseJSON(log, source)
 	done()
 	if !ok {
 		return false
@@ -67,6 +68,32 @@ func (args *args) parseDefine(key string, value string) bool {
 		return true
 	}
 	return false
+}
+
+func (args *args) parseLoader(key string, value string) bool {
+	var loader bundler.Loader
+
+	switch value {
+	case "js":
+		loader = bundler.LoaderJS
+	case "jsx":
+		loader = bundler.LoaderJSX
+	case "ts":
+		loader = bundler.LoaderTS
+	case "tsx":
+		loader = bundler.LoaderTSX
+	case "json":
+		loader = bundler.LoaderJSON
+	case "text":
+		loader = bundler.LoaderText
+	case "base64":
+		loader = bundler.LoaderBase64
+	default:
+		return false
+	}
+
+	args.bundleOptions.ExtensionToLoader[key] = loader
+	return true
 }
 
 func (args *args) parseMemberExpression(text string) ([]string, bool) {
@@ -84,7 +111,13 @@ func parseArgs() args {
 		parseOptions: parser.ParseOptions{
 			Defines: make(map[string]ast.E),
 		},
-		bundleOptions: bundler.BundleOptions{},
+		bundleOptions: bundler.BundleOptions{
+			ExtensionToLoader: bundler.DefaultExtensionToLoaderMap(),
+		},
+		resolveOptions: resolver.ResolveOptions{
+			ExtensionOrder:  []string{".tsx", ".ts", ".jsx", ".js", ".json"},
+			ExternalModules: make(map[string]bool),
+		},
 		logOptions: logging.StderrOptions{
 			IncludeSource:      true,
 			ErrorLimit:         10,
@@ -117,6 +150,9 @@ Options:
   --sourcemap           Emit a source map
   --error-limit=...     Maximum error count or 0 to disable (default 10)
   --target=...          Language target (default esnext)
+  --platform=...        Platform target (browser or node, default browser)
+  --external:M          Exclude module M from the bundle
+  --format=...          Output format (iife or cjs)
 
   --minify              Sets all --minify-* flags
   --minify-whitespace   Remove whitespace
@@ -126,13 +162,22 @@ Options:
   --define:K=V          Substitute K with V while parsing
   --jsx-factory=...     What to use instead of React.createElement
   --jsx-fragment=...    What to use instead of React.Fragment
+  --loader:X=L          Use loader L to load file extension X, where L is
+                        one of: js, jsx, ts, tsx, json, text, base64
 
   --trace=...           Write a CPU trace to this file
   --cpuprofile=...      Write a CPU profile to this file
+  --version             Print the current version and exit (` + esbuildVersion + `)
 
-Example:
+Examples:
   # Produces dist/entry_point.js and dist/entry_point.js.map
   esbuild --bundle entry_point.js --outdir=dist --minify --sourcemap
+
+  # Allow JSX syntax in .js files
+  esbuild --bundle entry_point.js --outfile=out.js --loader:.js=jsx
+
+  # Substitute the identifier RELEASE for the literal true
+  esbuild example.js --outfile=out.js --define:RELEASE=true
 
 `)
 		os.Exit(0)
@@ -142,7 +187,7 @@ Example:
 		switch {
 		case arg == "--bundle":
 			args.parseOptions.IsBundling = true
-			args.bundleOptions.Bundle = true
+			args.bundleOptions.IsBundling = true
 
 		case arg == "--minify":
 			args.parseOptions.MangleSyntax = true
@@ -162,6 +207,10 @@ Example:
 
 		case arg == "--sourcemap":
 			args.bundleOptions.SourceMap = true
+
+		case arg == "--version":
+			fmt.Fprintf(os.Stderr, "%s\n", esbuildVersion)
+			os.Exit(0)
 
 		case strings.HasPrefix(arg, "--error-limit="):
 			value, err := strconv.Atoi(arg[len("--error-limit="):])
@@ -197,10 +246,27 @@ Example:
 			text := arg[len("--define:"):]
 			equals := strings.IndexByte(text, '=')
 			if equals == -1 {
-				args.exitWithError(fmt.Sprintf("Missing '=': %s", arg))
+				args.exitWithError(fmt.Sprintf("Missing \"=\": %s", arg))
 			}
 			if !args.parseDefine(text[:equals], text[equals+1:]) {
 				args.exitWithError(fmt.Sprintf("Invalid define: %s", arg))
+			}
+
+		case strings.HasPrefix(arg, "--loader:"):
+			text := arg[len("--loader:"):]
+			equals := strings.IndexByte(text, '=')
+			if equals == -1 {
+				args.exitWithError(fmt.Sprintf("Missing \"=\": %s", arg))
+			}
+			extension, loader := text[:equals], text[equals+1:]
+			if !strings.HasPrefix(extension, ".") {
+				args.exitWithError(fmt.Sprintf("File extension must start with \".\": %s", arg))
+			}
+			if len(extension) < 2 || strings.ContainsRune(extension[1:], '.') {
+				args.exitWithError(fmt.Sprintf("Invalid file extension: %s", arg))
+			}
+			if !args.parseLoader(extension, loader) {
+				args.exitWithError(fmt.Sprintf("Invalid loader: %s", arg))
 			}
 
 		case strings.HasPrefix(arg, "--target="):
@@ -222,6 +288,33 @@ Example:
 			default:
 				args.exitWithError("Valid targets: es6, es2015, es2016, es2017, es2018, es2019, es2020, esnext")
 			}
+
+		case strings.HasPrefix(arg, "--platform="):
+			switch arg[len("--platform="):] {
+			case "browser":
+				args.resolveOptions.Platform = resolver.PlatformBrowser
+			case "node":
+				args.resolveOptions.Platform = resolver.PlatformNode
+			default:
+				args.exitWithError("Valid platforms: browser, node")
+			}
+
+		case strings.HasPrefix(arg, "--format="):
+			switch arg[len("--format="):] {
+			case "iife":
+				args.bundleOptions.OutputFormat = bundler.FormatIIFE
+			case "cjs":
+				args.bundleOptions.OutputFormat = bundler.FormatCommonJS
+			default:
+				args.exitWithError("Valid formats: iife, cjs")
+			}
+
+		case strings.HasPrefix(arg, "--external:"):
+			path := arg[len("--external:"):]
+			if resolver.IsNonModulePath(path) {
+				args.exitWithError(fmt.Sprintf("Invalid module name: %s", arg))
+			}
+			args.resolveOptions.ExternalModules[path] = true
 
 		case strings.HasPrefix(arg, "--jsx-factory="):
 			if parts, ok := args.parseMemberExpression(arg[len("--jsx-factory="):]); ok {
@@ -266,6 +359,16 @@ Example:
 	if args.bundleOptions.AbsOutputFile != "" {
 		// If the output file is specified, use it to derive the output directory
 		args.bundleOptions.AbsOutputDir = filepath.Dir(args.bundleOptions.AbsOutputFile)
+	}
+
+	if args.bundleOptions.OutputFormat == bundler.FormatNone {
+		// If the format isn't specified, set the default format using the platform
+		switch args.resolveOptions.Platform {
+		case resolver.PlatformBrowser:
+			args.bundleOptions.OutputFormat = bundler.FormatIIFE
+		case resolver.PlatformNode:
+			args.bundleOptions.OutputFormat = bundler.FormatCommonJS
+		}
 	}
 
 	return args
@@ -316,9 +419,9 @@ func main() {
 
 		// Parse all files in the bundle
 		fs := fs.RealFS()
-		resolver := resolver.NewResolver(fs, []string{".jsx", ".js", ".json"})
+		resolver := resolver.NewResolver(fs, args.resolveOptions)
 		log, join := logging.NewStderrLog(args.logOptions)
-		bundle := bundler.ScanBundle(log, fs, resolver, args.entryPaths, args.parseOptions)
+		bundle := bundler.ScanBundle(log, fs, resolver, args.entryPaths, args.parseOptions, args.bundleOptions)
 
 		// Stop now if there were errors
 		if join().Errors != 0 {

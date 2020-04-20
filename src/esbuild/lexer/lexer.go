@@ -31,6 +31,9 @@ const (
 	TEndOfFile T = iota
 	TSyntaxError
 
+	// "#!/usr/bin/env node"
+	THashbang
+
 	// Literals
 	TNoSubstitutionTemplateLiteral // Contents are in lexer.StringLiteral ([]uint16)
 	TNumericLiteral                // Contents are in lexer.Number (float64)
@@ -127,7 +130,7 @@ const (
 	TIf
 	TImport
 	TIn
-	TInstanceOf
+	TInstanceof
 	TNew
 	TNull
 	TReturn
@@ -137,7 +140,7 @@ const (
 	TThrow
 	TTrue
 	TTry
-	TTypeOf
+	TTypeof
 	TVar
 	TVoid
 	TWhile
@@ -178,7 +181,7 @@ var keywords = map[string]T{
 	"if":         TIf,
 	"import":     TImport,
 	"in":         TIn,
-	"instanceof": TInstanceOf,
+	"instanceof": TInstanceof,
 	"new":        TNew,
 	"null":       TNull,
 	"return":     TReturn,
@@ -188,7 +191,7 @@ var keywords = map[string]T{
 	"throw":      TThrow,
 	"true":       TTrue,
 	"try":        TTry,
-	"typeof":     TTypeOf,
+	"typeof":     TTypeof,
 	"var":        TVar,
 	"void":       TVoid,
 	"while":      TWhile,
@@ -227,6 +230,10 @@ type Lexer struct {
 	Identifier                      string
 	Number                          float64
 	rescanCloseBraceAsTemplateToken bool
+	isStrictJSON                    bool
+
+	// The log is disabled during speculative scans that may backtrack
+	IsLogDisabled bool
 }
 
 type LexerPanic struct{}
@@ -235,6 +242,17 @@ func NewLexer(log logging.Log, source logging.Source) Lexer {
 	lexer := Lexer{
 		log:    log,
 		source: source,
+	}
+	lexer.step()
+	lexer.Next()
+	return lexer
+}
+
+func NewLexerJSON(log logging.Log, source logging.Source) Lexer {
+	lexer := Lexer{
+		log:          log,
+		source:       source,
+		isStrictJSON: true,
 	}
 	lexer.step()
 	lexer.Next()
@@ -278,8 +296,7 @@ func (lexer *Lexer) IsContextualKeyword(text string) bool {
 
 func (lexer *Lexer) ExpectContextualKeyword(text string) {
 	if !lexer.IsContextualKeyword(text) {
-		lexer.addError(lexer.Loc(), fmt.Sprintf("Expected %q but found %q", text, lexer.Raw()))
-		panic(LexerPanic{})
+		lexer.ExpectedString(fmt.Sprintf("%q", text))
 	}
 	lexer.Next()
 }
@@ -293,8 +310,10 @@ func (lexer *Lexer) SyntaxError() {
 			message = fmt.Sprintf("Syntax error \"\\x%02X\"", c)
 		} else if c >= 0x80 {
 			message = fmt.Sprintf("Syntax error \"\\u{%x}\"", c)
-		} else {
+		} else if c != '"' {
 			message = fmt.Sprintf("Syntax error \"%c\"", c)
+		} else {
+			message = "Syntax error '\"'"
 		}
 	}
 	lexer.addError(loc, message)
@@ -334,6 +353,72 @@ func (lexer *Lexer) ExpectOrInsertSemicolon() {
 	if lexer.Token == TSemicolon || (!lexer.HasNewlineBefore &&
 		lexer.Token != TCloseBrace && lexer.Token != TEndOfFile) {
 		lexer.Expect(TSemicolon)
+	}
+}
+
+// This parses a single "<" token. If that is the first part of a longer token,
+// this function splits off the first "<" and leaves the remainder of the
+// current token as another, smaller token. For example, "<<=" becomes "<=".
+func (lexer *Lexer) ExpectLessThan(isInsideJSXElement bool) {
+	switch lexer.Token {
+	case TLessThan:
+		if isInsideJSXElement {
+			lexer.NextInsideJSXElement()
+		} else {
+			lexer.Next()
+		}
+
+	case TLessThanEquals:
+		lexer.Token = TEquals
+		lexer.start++
+
+	case TLessThanLessThan:
+		lexer.Token = TLessThan
+		lexer.start++
+
+	case TLessThanLessThanEquals:
+		lexer.Token = TLessThanEquals
+		lexer.start++
+
+	default:
+		lexer.Expected(TLessThan)
+	}
+}
+
+// This parses a single ">" token. If that is the first part of a longer token,
+// this function splits off the first ">" and leaves the remainder of the
+// current token as another, smaller token. For example, ">>=" becomes ">=".
+func (lexer *Lexer) ExpectGreaterThan(isInsideJSXElement bool) {
+	switch lexer.Token {
+	case TGreaterThan:
+		if isInsideJSXElement {
+			lexer.NextInsideJSXElement()
+		} else {
+			lexer.Next()
+		}
+
+	case TGreaterThanEquals:
+		lexer.Token = TEquals
+		lexer.start++
+
+	case TGreaterThanGreaterThan:
+		lexer.Token = TGreaterThan
+		lexer.start++
+
+	case TGreaterThanGreaterThanEquals:
+		lexer.Token = TGreaterThanEquals
+		lexer.start++
+
+	case TGreaterThanGreaterThanGreaterThan:
+		lexer.Token = TGreaterThanGreaterThan
+		lexer.start++
+
+	case TGreaterThanGreaterThanGreaterThanEquals:
+		lexer.Token = TGreaterThanGreaterThanEquals
+		lexer.start++
+
+	default:
+		lexer.Expected(TGreaterThan)
 	}
 }
 
@@ -696,6 +781,25 @@ func (lexer *Lexer) Next() {
 		case -1: // This indicates the end of the file
 			lexer.Token = TEndOfFile
 
+		case '#':
+			if lexer.start == 0 && strings.HasPrefix(lexer.source.Contents, "#!") {
+				lexer.Token = THashbang
+			hashbang:
+				for {
+					lexer.step()
+					switch lexer.codePoint {
+					case '\r', '\n', '\u2028', '\u2029':
+						break hashbang
+
+					case -1: // This indicates the end of the file
+						break hashbang
+					}
+				}
+				lexer.Identifier = lexer.Raw()
+			} else {
+				lexer.SyntaxError()
+			}
+
 		case '\r', '\n', '\u2028', '\u2029':
 			lexer.step()
 			lexer.HasNewlineBefore = true
@@ -895,6 +999,9 @@ func (lexer *Lexer) Next() {
 						break singleLineComment
 					}
 				}
+				if lexer.isStrictJSON {
+					lexer.addRangeError(lexer.Range(), "JSON does not support comments")
+				}
 				continue
 
 			case '*':
@@ -922,6 +1029,9 @@ func (lexer *Lexer) Next() {
 					default:
 						lexer.step()
 					}
+				}
+				if lexer.isStrictJSON {
+					lexer.addRangeError(lexer.Range(), "JSON does not support comments")
 				}
 				continue
 
@@ -1038,7 +1148,7 @@ func (lexer *Lexer) Next() {
 					lexer.step()
 
 					// Handle Windows CRLF
-					if lexer.codePoint == '\r' {
+					if lexer.codePoint == '\r' && !lexer.isStrictJSON {
 						lexer.step()
 						if lexer.codePoint == '\n' {
 							lexer.step()
@@ -1079,6 +1189,8 @@ func (lexer *Lexer) Next() {
 					// Non-ASCII strings need the slow path
 					if lexer.codePoint >= 0x80 {
 						isASCII = false
+					} else if lexer.isStrictJSON && lexer.codePoint < 0x20 {
+						lexer.SyntaxError()
 					}
 				}
 				lexer.step()
@@ -1097,6 +1209,10 @@ func (lexer *Lexer) Next() {
 					copy[i] = uint16(text[i])
 				}
 				lexer.StringLiteral = copy
+			}
+
+			if quote == '\'' && lexer.isStrictJSON {
+				lexer.addRangeError(lexer.Range(), "JSON strings must use double quotes")
 			}
 
 		case '_', '$',
@@ -1203,7 +1319,7 @@ func (lexer *Lexer) scanIdentifierWithEscapes() (string, T) {
 
 	// Even though it was escaped, it must still be a valid identifier
 	if !IsIdentifier(text) {
-		lexer.log.AddRangeError(lexer.source, ast.Range{ast.Loc{int32(lexer.start)}, int32(lexer.end - lexer.start)},
+		lexer.addRangeError(ast.Range{ast.Loc{int32(lexer.start)}, int32(lexer.end - lexer.start)},
 			fmt.Sprintf("Invalid identifier: %q", text))
 	}
 
@@ -1660,8 +1776,7 @@ func (lexer *Lexer) decodeEscapeSequences(start int, text string) []uint16 {
 		c, width := utf8.DecodeRuneInString(text[i:])
 		i += width
 
-		switch c {
-		case '\\':
+		if c == '\\' {
 			c2, width2 := utf8.DecodeRuneInString(text[i:])
 			i += width2
 
@@ -1687,10 +1802,20 @@ func (lexer *Lexer) decodeEscapeSequences(start int, text string) []uint16 {
 				continue
 
 			case 'v':
+				if lexer.isStrictJSON {
+					lexer.end = start + i - width2
+					lexer.SyntaxError()
+				}
+
 				decoded = append(decoded, '\v')
 				continue
 
 			case '0', '1', '2', '3', '4', '5', '6', '7':
+				if lexer.isStrictJSON {
+					lexer.end = start + i - width2
+					lexer.SyntaxError()
+				}
+
 				// 1-3 digit octal
 				value := c2 - '0'
 				c3, width3 := utf8.DecodeRuneInString(text[i:])
@@ -1711,6 +1836,11 @@ func (lexer *Lexer) decodeEscapeSequences(start int, text string) []uint16 {
 				c = value
 
 			case 'x':
+				if lexer.isStrictJSON {
+					lexer.end = start + i - width2
+					lexer.SyntaxError()
+				}
+
 				// 2-digit hexadecimal
 				value := '\000'
 				for j := 0; j < 2; j++ {
@@ -1739,6 +1869,11 @@ func (lexer *Lexer) decodeEscapeSequences(start int, text string) []uint16 {
 				i += width3
 
 				if c3 == '{' {
+					if lexer.isStrictJSON {
+						lexer.end = start + i - width2
+						lexer.SyntaxError()
+					}
+
 					// Variable-length
 					hexStart := i - width - width2 - width3
 					isFirst := true
@@ -1802,6 +1937,11 @@ func (lexer *Lexer) decodeEscapeSequences(start int, text string) []uint16 {
 				c = value
 
 			case '\r':
+				if lexer.isStrictJSON {
+					lexer.end = start + i - width2
+					lexer.SyntaxError()
+				}
+
 				// Ignore line continuations. A line continuation is not an escaped newline.
 				if i < len(text) && text[i] == '\n' {
 					// Make sure Windows CRLF counts as a single newline
@@ -1810,10 +1950,25 @@ func (lexer *Lexer) decodeEscapeSequences(start int, text string) []uint16 {
 				continue
 
 			case '\n', '\u2028', '\u2029':
+				if lexer.isStrictJSON {
+					lexer.end = start + i - width2
+					lexer.SyntaxError()
+				}
+
 				// Ignore line continuations. A line continuation is not an escaped newline.
 				continue
 
 			default:
+				if lexer.isStrictJSON {
+					switch c2 {
+					case '"', '\\', '/':
+
+					default:
+						lexer.end = start + i - width2
+						lexer.SyntaxError()
+					}
+				}
+
 				c = c2
 			}
 		}
@@ -1856,11 +2011,15 @@ func (lexer *Lexer) step() {
 }
 
 func (lexer *Lexer) addError(loc ast.Loc, text string) {
-	lexer.log.AddError(lexer.source, loc, text)
+	if !lexer.IsLogDisabled {
+		lexer.log.AddError(lexer.source, loc, text)
+	}
 }
 
 func (lexer *Lexer) addRangeError(r ast.Range, text string) {
-	lexer.log.AddRangeError(lexer.source, r, text)
+	if !lexer.IsLogDisabled {
+		lexer.log.AddRangeError(lexer.source, r, text)
+	}
 }
 
 func StringToUTF16(text string) []uint16 {

@@ -12,7 +12,7 @@ func assertEqual(t *testing.T, a interface{}, b interface{}) {
 	}
 }
 
-func expectPrintedCommon(t *testing.T, name string, contents string, expected string, options Options) {
+func expectPrintedCommon(t *testing.T, name string, contents string, expected string, options PrintOptions) {
 	t.Run(name, func(t *testing.T) {
 		log, join := logging.NewDeferLog()
 		ast, ok := parser.Parse(log, logging.Source{
@@ -30,19 +30,23 @@ func expectPrintedCommon(t *testing.T, name string, contents string, expected st
 		if !ok {
 			t.Fatal("Parse error")
 		}
-		js, _ := Print(ast, options)
+		js := Print(ast, options).JS
 		assertEqual(t, string(js), expected)
 	})
 }
 
 func expectPrinted(t *testing.T, contents string, expected string) {
-	expectPrintedCommon(t, contents, contents, expected, Options{})
+	expectPrintedCommon(t, contents, contents, expected, PrintOptions{})
 }
 
 func expectPrintedMinify(t *testing.T, contents string, expected string) {
-	expectPrintedCommon(t, contents+" [minified]", contents, expected, Options{
+	expectPrintedCommon(t, contents+" [minified]", contents, expected, PrintOptions{
 		RemoveWhitespace: true,
 	})
+}
+
+func TestHashbang(t *testing.T) {
+	expectPrinted(t, "#!/usr/bin/env node\nlet x", "#!/usr/bin/env node\nlet x;\n")
 }
 
 func TestArray(t *testing.T) {
@@ -332,12 +336,12 @@ func TestExportDefault(t *testing.T) {
 	expectPrinted(t, "export default (class {}.toString())", "export default (class {\n}).toString();\n")
 	expectPrinted(t, "export default (class foo {}.toString())", "export default (class foo {\n}).toString();\n")
 
-	expectPrintedMinify(t, "export default function() {}", "export default function(){}\n")
-	expectPrintedMinify(t, "export default function foo() {}", "export default function foo(){}\n")
-	expectPrintedMinify(t, "export default async function() {}", "export default async function(){}\n")
-	expectPrintedMinify(t, "export default async function foo() {}", "export default async function foo(){}\n")
-	expectPrintedMinify(t, "export default class {}", "export default class{}\n")
-	expectPrintedMinify(t, "export default class foo {}", "export default class foo{}\n")
+	expectPrintedMinify(t, "export default function() {}", "export default function(){}")
+	expectPrintedMinify(t, "export default function foo() {}", "export default function foo(){}")
+	expectPrintedMinify(t, "export default async function() {}", "export default async function(){}")
+	expectPrintedMinify(t, "export default async function foo() {}", "export default async function foo(){}")
+	expectPrintedMinify(t, "export default class {}", "export default class{}")
+	expectPrintedMinify(t, "export default class foo {}", "export default class foo{}")
 }
 
 func TestWhitespace(t *testing.T) {
@@ -350,81 +354,86 @@ func TestWhitespace(t *testing.T) {
 	expectPrinted(t, "- ++x", "-++x;\n")
 	expectPrinted(t, "+ ++x", "+ ++x;\n")
 
-	expectPrintedMinify(t, "- -x", "- -x;\n")
-	expectPrintedMinify(t, "+ -x", "+-x;\n")
-	expectPrintedMinify(t, "- +x", "-+x;\n")
-	expectPrintedMinify(t, "+ +x", "+ +x;\n")
-	expectPrintedMinify(t, "- --x", "- --x;\n")
-	expectPrintedMinify(t, "+ --x", "+--x;\n")
-	expectPrintedMinify(t, "- ++x", "-++x;\n")
-	expectPrintedMinify(t, "+ ++x", "+ ++x;\n")
+	expectPrintedMinify(t, "- -x", "- -x;")
+	expectPrintedMinify(t, "+ -x", "+-x;")
+	expectPrintedMinify(t, "- +x", "-+x;")
+	expectPrintedMinify(t, "+ +x", "+ +x;")
+	expectPrintedMinify(t, "- --x", "- --x;")
+	expectPrintedMinify(t, "+ --x", "+--x;")
+	expectPrintedMinify(t, "- ++x", "-++x;")
+	expectPrintedMinify(t, "+ ++x", "+ ++x;")
 
-	expectPrintedMinify(t, "x - --y", "x- --y;\n")
-	expectPrintedMinify(t, "x + --y", "x+--y;\n")
-	expectPrintedMinify(t, "x - ++y", "x-++y;\n")
-	expectPrintedMinify(t, "x + ++y", "x+ ++y;\n")
+	expectPrintedMinify(t, "x - --y", "x- --y;")
+	expectPrintedMinify(t, "x + --y", "x+--y;")
+	expectPrintedMinify(t, "x - ++y", "x-++y;")
+	expectPrintedMinify(t, "x + ++y", "x+ ++y;")
 
-	expectPrintedMinify(t, "x-- > y", "x-- >y;\n")
-	expectPrintedMinify(t, "x < !--y", "x<! --y;\n")
-	expectPrintedMinify(t, "x > !--y", "x>!--y;\n")
-	expectPrintedMinify(t, "!--y", "!--y;\n")
+	expectPrintedMinify(t, "x-- > y", "x-- >y;")
+	expectPrintedMinify(t, "x < !--y", "x<! --y;")
+	expectPrintedMinify(t, "x > !--y", "x>!--y;")
+	expectPrintedMinify(t, "!--y", "!--y;")
 
-	expectPrintedMinify(t, "1 + -0", "1+-0;\n")
-	expectPrintedMinify(t, "1 - -0", "1- -0;\n")
-	expectPrintedMinify(t, "1 + -Infinity", "1+-Infinity;\n")
-	expectPrintedMinify(t, "1 - -Infinity", "1- -Infinity;\n")
+	expectPrintedMinify(t, "1 + -0", "1+-0;")
+	expectPrintedMinify(t, "1 - -0", "1- -0;")
+	expectPrintedMinify(t, "1 + -Infinity", "1+-Infinity;")
+	expectPrintedMinify(t, "1 - -Infinity", "1- -Infinity;")
 
-	expectPrintedMinify(t, "/x/ / /y/", "/x// /y/;\n")
-	expectPrintedMinify(t, "/x/ + Foo", "/x/+Foo;\n")
-	expectPrintedMinify(t, "/x/ instanceof Foo", "/x/ instanceof Foo;\n")
-	expectPrintedMinify(t, "[x] instanceof Foo", "[x]instanceof Foo;\n")
+	expectPrintedMinify(t, "/x/ / /y/", "/x// /y/;")
+	expectPrintedMinify(t, "/x/ + Foo", "/x/+Foo;")
+	expectPrintedMinify(t, "/x/ instanceof Foo", "/x/ instanceof Foo;")
+	expectPrintedMinify(t, "[x] instanceof Foo", "[x]instanceof Foo;")
 
-	expectPrintedMinify(t, "throw x", "throw x;\n")
-	expectPrintedMinify(t, "throw typeof x", "throw typeof x;\n")
-	expectPrintedMinify(t, "throw delete x", "throw delete x;\n")
-	expectPrintedMinify(t, "throw function(){}", "throw function(){};\n")
+	expectPrintedMinify(t, "throw x", "throw x;")
+	expectPrintedMinify(t, "throw typeof x", "throw typeof x;")
+	expectPrintedMinify(t, "throw delete x", "throw delete x;")
+	expectPrintedMinify(t, "throw function(){}", "throw function(){};")
 
-	expectPrintedMinify(t, "x in function(){}", "x in function(){};\n")
-	expectPrintedMinify(t, "x instanceof function(){}", "x instanceof function(){};\n")
+	expectPrintedMinify(t, "x in function(){}", "x in function(){};")
+	expectPrintedMinify(t, "x instanceof function(){}", "x instanceof function(){};")
 
-	expectPrintedMinify(t, "()=>({})", "()=>({});\n")
-	expectPrintedMinify(t, "()=>({}[1])", "()=>({})[1];\n")
-	expectPrintedMinify(t, "()=>({}+0)", "()=>({})+0;\n")
-	expectPrintedMinify(t, "()=>function(){}", "()=>function(){};\n")
+	expectPrintedMinify(t, "()=>({})", "()=>({});")
+	expectPrintedMinify(t, "()=>({}[1])", "()=>({})[1];")
+	expectPrintedMinify(t, "()=>({}+0)", "()=>({})+0;")
+	expectPrintedMinify(t, "()=>function(){}", "()=>function(){};")
 
-	expectPrintedMinify(t, "(function(){})", "(function(){});\n")
-	expectPrintedMinify(t, "(class{})", "(class{});\n")
-	expectPrintedMinify(t, "({})", "({});\n")
+	expectPrintedMinify(t, "(function(){})", "(function(){});")
+	expectPrintedMinify(t, "(class{})", "(class{});")
+	expectPrintedMinify(t, "({})", "({});")
 
-	expectPrintedMinify(t, "let x = '\\n'", "let x=`\n`;\n")
+	expectPrintedMinify(t, "let x = '\\n'", "let x=`\n`;")
 }
 
 func TestMinify(t *testing.T) {
-	expectPrintedMinify(t, "0.1", ".1;\n")
-	expectPrintedMinify(t, "1.2", "1.2;\n")
+	expectPrintedMinify(t, "0.1", ".1;")
+	expectPrintedMinify(t, "1.2", "1.2;")
 
-	expectPrintedMinify(t, "() => {}", "()=>{};\n")
-	expectPrintedMinify(t, "(a) => {}", "a=>{};\n")
-	expectPrintedMinify(t, "(...a) => {}", "(...a)=>{};\n")
-	expectPrintedMinify(t, "(a = 0) => {}", "(a=0)=>{};\n")
-	expectPrintedMinify(t, "(a, b) => {}", "(a,b)=>{};\n")
+	expectPrintedMinify(t, "() => {}", "()=>{};")
+	expectPrintedMinify(t, "(a) => {}", "a=>{};")
+	expectPrintedMinify(t, "(...a) => {}", "(...a)=>{};")
+	expectPrintedMinify(t, "(a = 0) => {}", "(a=0)=>{};")
+	expectPrintedMinify(t, "(a, b) => {}", "(a,b)=>{};")
 
 	expectPrinted(t, "true ** 2", "true ** 2;\n")
 	expectPrinted(t, "false ** 2", "false ** 2;\n")
-	expectPrintedMinify(t, "true ** 2", "(!0)**2;\n")
-	expectPrintedMinify(t, "false ** 2", "(!1)**2;\n")
+	expectPrintedMinify(t, "true ** 2", "(!0)**2;")
+	expectPrintedMinify(t, "false ** 2", "(!1)**2;")
 
-	expectPrintedMinify(t, "export * as ns from 'path'", "export*as ns from\"path\";\n")
+	expectPrintedMinify(t, "import a from 'path'", "import a from\"path\";")
+	expectPrintedMinify(t, "import * as ns from 'path'", "import*as ns from\"path\";")
+	expectPrintedMinify(t, "import {a, b as c} from 'path'", "import{a,b as c}from\"path\";")
+
+	expectPrintedMinify(t, "export * as ns from 'path'", "export*as ns from\"path\";")
+	expectPrintedMinify(t, "export {a, b as c} from 'path'", "export{a,b as c}from\"path\";")
 
 	// Print some strings using template literals when minifying
 	expectPrinted(t, "'\\n'", "\"\\n\";\n")
-	expectPrintedMinify(t, "'\\n'", "`\n`;\n")
-	expectPrintedMinify(t, "({'\\n': 0})", "({\"\\n\":0});\n")
-	expectPrintedMinify(t, "(class{'\\n' = 0})", "(class{\"\\n\"=0});\n")
-	expectPrintedMinify(t, "class Foo{'\\n' = 0}", "class Foo{\"\\n\"=0}\n")
+	expectPrintedMinify(t, "'\\n'", "`\n`;")
+	expectPrintedMinify(t, "({'\\n': 0})", "({\"\\n\":0});")
+	expectPrintedMinify(t, "(class{'\\n' = 0})", "(class{\"\\n\"=0});")
+	expectPrintedMinify(t, "class Foo{'\\n' = 0}", "class Foo{\"\\n\"=0}")
 
 	// Special identifiers must not be minified
-	expectPrintedMinify(t, "exports", "exports;\n")
-	expectPrintedMinify(t, "require", "require;\n")
-	expectPrintedMinify(t, "module", "module;\n")
+	expectPrintedMinify(t, "exports", "exports;")
+	expectPrintedMinify(t, "require", "require;")
+	expectPrintedMinify(t, "module", "module;")
 }

@@ -16,6 +16,7 @@ const (
 	ResolveMissing ResolveStatus = iota
 	ResolveEnabled
 	ResolveDisabled
+	ResolveExternal
 )
 
 type Resolver interface {
@@ -24,9 +25,22 @@ type Resolver interface {
 	PrettyPath(path string) string
 }
 
+type Platform uint8
+
+const (
+	PlatformBrowser Platform = iota
+	PlatformNode
+)
+
+type ResolveOptions struct {
+	ExtensionOrder  []string
+	Platform        Platform
+	ExternalModules map[string]bool
+}
+
 type resolver struct {
-	fs             fs.FS
-	extensionOrder []string
+	fs      fs.FS
+	options ResolveOptions
 
 	// This cache maps a directory path to information about that directory and
 	// all parent directories
@@ -34,11 +48,25 @@ type resolver struct {
 	dirCache      map[string]*dirInfo
 }
 
-func NewResolver(fs fs.FS, extensionOrder []string) Resolver {
+func NewResolver(fs fs.FS, options ResolveOptions) Resolver {
+	// Bundling for node implies allowing node's builtin modules
+	if options.Platform == PlatformNode {
+		externalModules := make(map[string]bool)
+		if options.ExternalModules != nil {
+			for name, _ := range options.ExternalModules {
+				externalModules[name] = true
+			}
+		}
+		for _, name := range externalModulesForNode {
+			externalModules[name] = true
+		}
+		options.ExternalModules = externalModules
+	}
+
 	return &resolver{
-		fs:             fs,
-		extensionOrder: extensionOrder,
-		dirCache:       make(map[string]*dirInfo),
+		fs:       fs,
+		options:  options,
+		dirCache: make(map[string]*dirInfo),
 	}
 }
 
@@ -50,22 +78,21 @@ func (r *resolver) Resolve(sourcePath string, importPath string) (string, Resolv
 	// Get the cached information for this directory and all parent directories
 	sourceDir := r.fs.Dir(sourcePath)
 
-	if isNonModulePath(importPath) {
-		absolute, ok := r.loadAsFileOrDirectory(r.fs.Join(sourceDir, importPath))
-		if !ok {
+	if IsNonModulePath(importPath) {
+		if absolute, ok := r.loadAsFileOrDirectory(r.fs.Join(sourceDir, importPath)); ok {
+			result = absolute
+		} else {
 			return "", ResolveMissing
 		}
-		result = absolute
 	} else {
+		// Check for external modules first
+		if r.options.ExternalModules != nil && r.options.ExternalModules[importPath] {
+			return "", ResolveExternal
+		}
+
 		sourceDirInfo := r.dirInfoCached(sourceDir)
 		if sourceDirInfo == nil {
 			// Bail no if the directory is missing for some reason
-			return "", ResolveMissing
-		}
-
-		absolute, ok := r.loadNodeModules(importPath, sourceDirInfo)
-		if !ok {
-			// Note: node's "self references" are not currently supported
 			return "", ResolveMissing
 		}
 
@@ -75,17 +102,28 @@ func (r *resolver) Resolve(sourcePath string, importPath string) (string, Resolv
 			if packageJson.browserModuleMap != nil {
 				if remapped, ok := packageJson.browserModuleMap[importPath]; ok {
 					if remapped == nil {
-						return absolute, ResolveDisabled
-					}
-					absolute, ok = r.resolveWithoutRemapping(sourceDirInfo.enclosingBrowserScope, *remapped)
-					if !ok {
-						return "", ResolveMissing
+						// "browser": {"module": false}
+						if absolute, ok := r.loadNodeModules(importPath, sourceDirInfo); ok {
+							return absolute, ResolveDisabled
+						} else {
+							return "", ResolveMissing
+						}
+					} else {
+						// "browser": {"module": "./some-file"}
+						// "browser": {"module": "another-module"}
+						importPath = *remapped
+						sourceDirInfo = sourceDirInfo.enclosingBrowserScope
 					}
 				}
 			}
 		}
 
-		result = absolute
+		if absolute, ok := r.resolveWithoutRemapping(sourceDirInfo, importPath); ok {
+			result = absolute
+		} else {
+			// Note: node's "self references" are not currently supported
+			return "", ResolveMissing
+		}
 	}
 
 	// Check the directory that contains this file
@@ -112,7 +150,7 @@ func (r *resolver) Resolve(sourcePath string, importPath string) (string, Resolv
 }
 
 func (r *resolver) resolveWithoutRemapping(sourceDirInfo *dirInfo, importPath string) (string, bool) {
-	if isNonModulePath(importPath) {
+	if IsNonModulePath(importPath) {
 		return r.loadAsFileOrDirectory(r.fs.Join(sourceDirInfo.absPath, importPath))
 	} else {
 		return r.loadNodeModules(importPath, sourceDirInfo)
@@ -272,8 +310,8 @@ func (r *resolver) parsePackageJson(path string) *packageJson {
 		}
 	}
 
-	// Read the "browser" property
-	if browserJson, ok := getProperty(json, "browser"); ok {
+	// Read the "browser" property, but only when targeting the browser
+	if browserJson, ok := getProperty(json, "browser"); ok && r.options.Platform == PlatformBrowser {
 		if browser, ok := getString(browserJson); ok {
 			// The value is a string
 			mainPath = r.fs.Join(path, browser)
@@ -285,7 +323,7 @@ func (r *resolver) parsePackageJson(path string) *packageJson {
 			// Remap all files in the browser field
 			for _, prop := range browser.Properties {
 				if key, ok := getString(prop.Key); ok && prop.Value != nil {
-					isNonModulePath := isNonModulePath(key)
+					isNonModulePath := IsNonModulePath(key)
 
 					// Make this an absolute path if it's not a module
 					if isNonModulePath {
@@ -347,7 +385,7 @@ func (r *resolver) loadAsFile(path string) (string, bool) {
 		}
 
 		// Try the path with extensions
-		for _, ext := range r.extensionOrder {
+		for _, ext := range r.options.ExtensionOrder {
 			if entries[base+ext] == fs.FileEntry {
 				return path + ext, true
 			}
@@ -362,7 +400,7 @@ func (r *resolver) loadAsFile(path string) (string, bool) {
 // passed down to us.
 func (r *resolver) loadAsIndex(path string, entries map[string]fs.Entry) (string, bool) {
 	// Try the "index" file with extensions
-	for _, ext := range r.extensionOrder {
+	for _, ext := range r.options.ExtensionOrder {
 		base := "index" + ext
 		if entries[base] == fs.FileEntry {
 			return r.fs.Join(path, base), true
@@ -376,7 +414,7 @@ func (r *resolver) parseJson(path string) (ast.Expr, bool) {
 	if contents, ok := r.fs.ReadFile(path); ok {
 		log, _ := logging.NewDeferLog()
 		source := logging.Source{Contents: contents}
-		return parser.ParseJson(log, source)
+		return parser.ParseJSON(log, source)
 	}
 	return ast.Expr{}, false
 }
@@ -461,6 +499,50 @@ func (r *resolver) loadNodeModules(path string, dirInfo *dirInfo) (string, bool)
 	return "", false
 }
 
-func isNonModulePath(path string) bool {
-	return strings.HasPrefix(path, "/") || strings.HasPrefix(path, "./") || strings.HasPrefix(path, "../") || path == "."
+func IsNonModulePath(path string) bool {
+	return strings.HasPrefix(path, "/") || strings.HasPrefix(path, "./") ||
+		strings.HasPrefix(path, "../") || path == "." || path == ".."
+}
+
+var externalModulesForNode = []string{
+	"assert",
+	"async_hooks",
+	"buffer",
+	"child_process",
+	"cluster",
+	"console",
+	"constants",
+	"crypto",
+	"dgram",
+	"dns",
+	"domain",
+	"events",
+	"fs",
+	"http",
+	"http2",
+	"https",
+	"inspector",
+	"module",
+	"net",
+	"os",
+	"path",
+	"perf_hooks",
+	"process",
+	"punycode",
+	"querystring",
+	"readline",
+	"repl",
+	"stream",
+	"string_decoder",
+	"sys",
+	"timers",
+	"tls",
+	"trace_events",
+	"tty",
+	"url",
+	"util",
+	"v8",
+	"vm",
+	"worker_threads",
+	"zlib",
 }

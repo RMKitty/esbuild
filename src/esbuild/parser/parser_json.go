@@ -4,12 +4,25 @@ import (
 	"esbuild/ast"
 	"esbuild/lexer"
 	"esbuild/logging"
+	"fmt"
 )
 
 type jsonParser struct {
 	log    logging.Log
 	source logging.Source
 	lexer  lexer.Lexer
+}
+
+func (p *jsonParser) parseMaybeTrailingComma(closeToken lexer.T) bool {
+	commaRange := p.lexer.Range()
+	p.lexer.Expect(lexer.TComma)
+
+	if p.lexer.Token == closeToken {
+		p.log.AddRangeError(p.source, commaRange, "JSON does not support trailing commas")
+		return false
+	}
+
+	return true
 }
 
 func (p *jsonParser) parseExpr() ast.Expr {
@@ -38,18 +51,23 @@ func (p *jsonParser) parseExpr() ast.Expr {
 		p.lexer.Next()
 		return ast.Expr{loc, &ast.ENumber{value}}
 
+	case lexer.TMinus:
+		p.lexer.Next()
+		value := p.lexer.Number
+		p.lexer.Expect(lexer.TNumericLiteral)
+		return ast.Expr{loc, &ast.ENumber{-value}}
+
 	case lexer.TOpenBracket:
 		p.lexer.Next()
 		items := []ast.Expr{}
 
 		for p.lexer.Token != lexer.TCloseBracket {
-			item := p.parseExpr()
-			items = append(items, item)
-
-			if p.lexer.Token != lexer.TComma {
+			if len(items) > 0 && !p.parseMaybeTrailingComma(lexer.TCloseBracket) {
 				break
 			}
-			p.lexer.Next()
+
+			item := p.parseExpr()
+			items = append(items, item)
 		}
 
 		p.lexer.Expect(lexer.TCloseBracket)
@@ -58,10 +76,26 @@ func (p *jsonParser) parseExpr() ast.Expr {
 	case lexer.TOpenBrace:
 		p.lexer.Next()
 		properties := []ast.Property{}
+		duplicates := make(map[string]bool)
 
 		for p.lexer.Token != lexer.TCloseBrace {
-			key := ast.Expr{p.lexer.Loc(), &ast.EString{p.lexer.StringLiteral}}
+			if len(properties) > 0 && !p.parseMaybeTrailingComma(lexer.TCloseBrace) {
+				break
+			}
+
+			keyString := p.lexer.StringLiteral
+			keyRange := p.lexer.Range()
+			key := ast.Expr{keyRange.Loc, &ast.EString{keyString}}
 			p.lexer.Expect(lexer.TStringLiteral)
+
+			// Warn about duplicate keys
+			keyText := lexer.UTF16ToString(keyString)
+			if duplicates[keyText] {
+				p.log.AddRangeWarning(p.source, keyRange, fmt.Sprintf("Duplicate key: %q", keyText))
+			} else {
+				duplicates[keyText] = true
+			}
+
 			p.lexer.Expect(lexer.TColon)
 			value := p.parseExpr()
 
@@ -71,11 +105,6 @@ func (p *jsonParser) parseExpr() ast.Expr {
 				Value: &value,
 			}
 			properties = append(properties, property)
-
-			if p.lexer.Token != lexer.TComma {
-				break
-			}
-			p.lexer.Next()
 		}
 
 		p.lexer.Expect(lexer.TCloseBrace)
@@ -87,7 +116,7 @@ func (p *jsonParser) parseExpr() ast.Expr {
 	}
 }
 
-func ParseJson(log logging.Log, source logging.Source) (result ast.Expr, ok bool) {
+func ParseJSON(log logging.Log, source logging.Source) (result ast.Expr, ok bool) {
 	ok = true
 	defer func() {
 		r := recover()
@@ -101,29 +130,10 @@ func ParseJson(log logging.Log, source logging.Source) (result ast.Expr, ok bool
 	p := &jsonParser{
 		log:    log,
 		source: source,
-		lexer:  lexer.NewLexer(log, source),
+		lexer:  lexer.NewLexerJSON(log, source),
 	}
 
 	result = p.parseExpr()
+	p.lexer.Expect(lexer.TEndOfFile)
 	return
-}
-
-func ModuleExportsAST(source logging.Source, expr ast.Expr) ast.AST {
-	b := newBinder(source, ParseOptions{})
-
-	// Make a symbol map that contains our file's symbols
-	symbols := ast.SymbolMap{make([][]ast.Symbol, source.Index+1)}
-	symbols.Outer[source.Index] = b.symbols
-
-	// "module.exports = [expr]"
-	stmt := ast.Stmt{expr.Loc, &ast.SExpr{ast.Expr{expr.Loc, &ast.EBinary{
-		ast.BinOpAssign,
-		ast.Expr{expr.Loc, &ast.EDot{ast.Expr{expr.Loc, &ast.EIdentifier{b.moduleRef}}, "exports", expr.Loc, false}},
-		expr,
-	}}}}
-
-	// Mark that we used the "module" variable
-	b.symbols[b.moduleRef.InnerIndex].UseCountEstimate++
-
-	return b.toAST(source, []ast.Stmt{stmt}, []ast.ImportPath{})
 }

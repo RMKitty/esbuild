@@ -393,9 +393,9 @@ type printer struct {
 	prevRegExpEnd      int
 
 	// For imports
-	resolvedImports     map[string]uint32
-	indirectImportItems map[ast.Ref]bool
-	requireRef          ast.Ref
+	resolvedImports map[string]uint32
+	requireRef      ast.Ref // For CommonJS imports
+	importRef       ast.Ref // For ES6 imports
 
 	// For source maps
 	writeSourceMap bool
@@ -690,7 +690,7 @@ func (p *printer) printClass(class ast.Class) {
 	if class.Extends != nil {
 		p.print(" extends")
 		p.printSpace()
-		p.printExpr(*class.Extends, ast.LNew, 0)
+		p.printExpr(*class.Extends, ast.LNew-1, 0)
 	}
 	p.printSpace()
 
@@ -799,9 +799,11 @@ func (p *printer) printProperty(item ast.Property) {
 						return
 					}
 
-				case *ast.ENamespaceImport:
+				case *ast.EImportIdentifier:
 					// Make sure we're not using a property access instead of an identifier
-					if !p.indirectImportItems[e.ItemRef] && text == p.symbolName(e.ItemRef) {
+					ref := ast.FollowSymbols(p.symbols, e.Ref)
+					symbol := p.symbols.Get(ref)
+					if symbol.NamespaceAlias == nil && text == symbol.Name {
 						if item.Initializer != nil {
 							p.printSpace()
 							p.print("=")
@@ -881,6 +883,34 @@ func (p *printer) bestQuoteCharForString(data []uint16, allowBacktick bool) stri
 		c = "`"
 	}
 	return c
+}
+
+func (p *printer) printRequireCall(path string, isES6Import bool) {
+	ref := p.requireRef
+	if isES6Import {
+		ref = p.importRef
+	}
+
+	if p.resolvedImports != nil {
+		// If we're bundling require calls, convert the string to a source index
+		if sourceIndex, ok := p.resolvedImports[path]; ok {
+			p.printSymbol(ref)
+			p.print(fmt.Sprintf("(%d", sourceIndex))
+			if !p.minify {
+				p.print(fmt.Sprintf(" /* %s */", path))
+			}
+		} else {
+			// If we get here, the module was marked as an external module
+			p.print("require(")
+			p.print(Quote(path))
+		}
+	} else {
+		p.printSymbol(ref)
+		p.print("(")
+		p.print(Quote(path))
+	}
+
+	p.print(")")
 }
 
 const (
@@ -979,35 +1009,7 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		if wrap {
 			p.print("(")
 		}
-		p.printSymbol(p.requireRef)
-		p.print("(")
-		if p.resolvedImports != nil {
-			// If we're bundling require calls, convert the string to a source index
-			sourceIndex, ok := p.resolvedImports[e.Path.Text]
-			if !ok {
-				panic("Internal error")
-			}
-			p.print(fmt.Sprintf("%d", sourceIndex))
-			if !p.minify {
-				p.print(fmt.Sprintf(" /* %s */", e.Path.Text))
-			}
-		} else {
-			p.print(Quote(e.Path.Text))
-		}
-
-		// If this require() call used to be an ES6 import, let the bootstrap code
-		// know so it can convert the default export format from CommonJS to ES6
-		if e.IsES6Import {
-			p.print(",")
-			p.printSpace()
-			if p.minify {
-				p.print("1")
-			} else {
-				p.print("true /* ES6 import */")
-			}
-		}
-
-		p.print(")")
+		p.printRequireCall(e.Path.Text, e.IsES6Import)
 		if wrap {
 			p.print(")")
 		}
@@ -1018,26 +1020,19 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 			p.print("(")
 		}
 		p.printSpaceBeforeIdentifier()
-		if p.resolvedImports != nil {
-			// If we're bundling require calls, convert the string to a source index
-			sourceIndex, ok := p.resolvedImports[e.Path.Text]
-			if !ok {
-				panic("Internal error")
-			}
+		if s, ok := e.Expr.Data.(*ast.EString); ok && p.resolvedImports != nil {
+			path := lexer.UTF16ToString(s.Value)
 			if p.minify {
 				p.print("Promise.resolve().then(()=>")
-				p.printSymbol(p.requireRef)
-				p.print(fmt.Sprintf("(%d))", sourceIndex))
 			} else {
 				p.print("Promise.resolve().then(() => ")
-				p.printSymbol(p.requireRef)
-				p.print(fmt.Sprintf("(%d /* %s */))", sourceIndex, e.Path.Text))
 			}
+			p.printRequireCall(path, true)
 		} else {
 			p.print("import(")
-			p.print(Quote(e.Path.Text))
-			p.print(")")
+			p.printExpr(e.Expr, ast.LComma, 0)
 		}
+		p.print(")")
 		if wrap {
 			p.print(")")
 		}
@@ -1264,7 +1259,8 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 
 	case *ast.ENumber:
 		value := e.Value
-		asUint32 := uint32(value)
+		absValue := math.Abs(value)
+		asUint32 := uint32(absValue)
 
 		// Expressions such as "(-1).toString" need to wrap negative numbers.
 		// Instead of testing for "value < 0" we test for "signbit(value)" and
@@ -1278,15 +1274,12 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		// Go will print "4294967295" as "4.294967295e+09" if we use the float64
 		// printer, so explicitly print integers using a separate code path. This
 		// should also serve as a fast path for the common case, so do this first.
-		if value == float64(asUint32) {
+		if absValue == float64(asUint32) {
 			text := strconv.FormatInt(int64(asUint32), 10)
-
-			// Make sure to preserve negative zero so constant-folding doesn't change semantics
-			if value == 0 && math.Signbit(value) && text[0] != '-' {
+			if math.Signbit(value) {
 				p.printSpaceBeforeOperator(ast.UnOpNeg)
 				p.print("-")
 			}
-
 			p.printSpaceBeforeIdentifier()
 			p.print(text)
 
@@ -1327,14 +1320,17 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		p.printSpaceBeforeIdentifier()
 		p.printSymbol(e.Ref)
 
-	case *ast.ENamespaceImport:
+	case *ast.EImportIdentifier:
 		// Potentially use a property access instead of an identifier
-		if p.indirectImportItems[e.ItemRef] {
-			p.printSymbol(e.NamespaceRef)
+		ref := ast.FollowSymbols(p.symbols, e.Ref)
+		symbol := p.symbols.Get(ref)
+		if symbol.NamespaceAlias != nil {
+			p.printSymbol(symbol.NamespaceAlias.NamespaceRef)
 			p.print(".")
-			p.print(e.Alias)
+			p.print(symbol.NamespaceAlias.Alias)
 		} else {
-			p.printSymbol(e.ItemRef)
+			p.printSpaceBeforeIdentifier()
+			p.print(symbol.Name)
 		}
 
 	case *ast.EAwait:
@@ -1500,12 +1496,15 @@ func (p *printer) printForLoopInit(init ast.Stmt) {
 	switch s := init.Data.(type) {
 	case *ast.SExpr:
 		p.printExpr(s.Value, ast.LLowest, forbidIn)
-	case *ast.SVar:
-		p.printDecls("var", s.Decls, forbidIn)
-	case *ast.SLet:
-		p.printDecls("let", s.Decls, forbidIn)
-	case *ast.SConst:
-		p.printDecls("const", s.Decls, forbidIn)
+	case *ast.SLocal:
+		switch s.Kind {
+		case ast.LocalVar:
+			p.printDecls("var", s.Decls, forbidIn)
+		case ast.LocalLet:
+			p.printDecls("let", s.Decls, forbidIn)
+		case ast.LocalConst:
+			p.printDecls("const", s.Decls, forbidIn)
+		}
 	default:
 		panic("Internal error")
 	}
@@ -1810,14 +1809,15 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 
 		p.printSemicolonAfterStatement()
 
-	case *ast.SConst:
-		p.printDeclStmt(s.IsExport, "const", s.Decls)
-
-	case *ast.SLet:
-		p.printDeclStmt(s.IsExport, "let", s.Decls)
-
-	case *ast.SVar:
-		p.printDeclStmt(s.IsExport, "var", s.Decls)
+	case *ast.SLocal:
+		switch s.Kind {
+		case ast.LocalConst:
+			p.printDeclStmt(s.IsExport, "const", s.Decls)
+		case ast.LocalLet:
+			p.printDeclStmt(s.IsExport, "let", s.Decls)
+		case ast.LocalVar:
+			p.printDeclStmt(s.IsExport, "var", s.Decls)
+		}
 
 	case *ast.SIf:
 		p.printIndent()
@@ -1929,7 +1929,7 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 			p.printSpace()
 			p.print("finally")
 			p.printSpace()
-			p.printBlock(*s.Finally)
+			p.printBlock(s.Finally.Stmts)
 		}
 
 		p.printNewline()
@@ -2057,7 +2057,9 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 		}
 
 		if itemCount > 0 {
-			p.print(" from")
+			p.printSpace()
+			p.printSpaceBeforeIdentifier()
+			p.print("from")
 			p.printSpace()
 		}
 
@@ -2133,11 +2135,13 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 	}
 }
 
-type Options struct {
+type PrintOptions struct {
 	RemoveWhitespace  bool
 	SourceMapContents *string
 	Indent            int
 	ResolvedImports   map[string]uint32
+	RequireRef        ast.Ref
+	ImportRef         ast.Ref
 }
 
 type SourceMapChunk struct {
@@ -2155,20 +2159,23 @@ type SourceMapChunk struct {
 
 func createPrinter(
 	symbols *ast.SymbolMap,
-	indirectImportItems map[ast.Ref]bool,
-	requireRef ast.Ref,
-	options Options,
+	options PrintOptions,
 ) *printer {
 	p := &printer{
-		symbols:             symbols,
-		indirectImportItems: indirectImportItems,
-		writeSourceMap:      options.SourceMapContents != nil,
-		minify:              options.RemoveWhitespace,
-		resolvedImports:     options.ResolvedImports,
-		indent:              options.Indent,
-		prevOpEnd:           -1,
-		prevLoc:             ast.Loc{-1},
-		requireRef:          requireRef,
+		symbols:            symbols,
+		writeSourceMap:     options.SourceMapContents != nil,
+		minify:             options.RemoveWhitespace,
+		resolvedImports:    options.ResolvedImports,
+		indent:             options.Indent,
+		stmtStart:          -1,
+		exportDefaultStart: -1,
+		arrowExprStart:     -1,
+		prevOpEnd:          -1,
+		prevNumEnd:         -1,
+		prevRegExpEnd:      -1,
+		prevLoc:            ast.Loc{-1},
+		requireRef:         options.RequireRef,
+		importRef:          options.ImportRef,
 	}
 
 	// If we're writing out a source map, prepare a table of line start indices
@@ -2195,12 +2202,32 @@ func createPrinter(
 	return p
 }
 
-func Print(tree ast.AST, options Options) ([]byte, SourceMapChunk) {
-	p := createPrinter(tree.Symbols, tree.IndirectImportItems, tree.RequireRef, options)
-	p.requireRef = tree.RequireRef
+type PrintResult struct {
+	JS []byte
+
+	// For minification, it's desirable to strip off unnecessary trailing
+	// semicolons from modules inside closures before the ending "}". However,
+	// there are some syntax constructs where you can't just remove the trailing
+	// semicolon (e.g. "while(foo());"). So we also return the source without the
+	// unnecessary trailing semicolon added in case the caller needs it.
+	JSWithoutTrailingSemicolon []byte
+
+	// This source map chunk just contains the VLQ-encoded offsets for the "JS"
+	// field above. It's not a full source map. The bundler will be joining many
+	// source map chunks together to form the final source map.
+	SourceMapChunk SourceMapChunk
+}
+
+func Print(tree ast.AST, options PrintOptions) PrintResult {
+	p := createPrinter(tree.Symbols, options)
 
 	// Always add a mapping at the beginning of the file
 	p.addSourceMapping(ast.Loc{0})
+
+	// Preserve the hashbang comment if present
+	if tree.Hashbang != "" {
+		p.print(tree.Hashbang + "\n")
+	}
 
 	for _, stmt := range tree.Stmts {
 		p.printSemicolonIfNeeded()
@@ -2209,20 +2236,28 @@ func Print(tree ast.AST, options Options) ([]byte, SourceMapChunk) {
 
 	// Make sure each module ends in a semicolon so we don't have weird issues
 	// with automatic semicolon insertion when concatenating modules together
+	jsWithoutTrailingSemicolon := p.js
 	if options.RemoveWhitespace && len(p.js) > 0 && p.js[len(p.js)-1] != '\n' {
 		p.printSemicolonIfNeeded()
-		p.print("\n")
 	}
 
-	return p.js, SourceMapChunk{p.sourceMap, p.prevState, len(p.js) - p.prevLineStart}
+	return PrintResult{
+		JS:                         p.js,
+		JSWithoutTrailingSemicolon: jsWithoutTrailingSemicolon,
+		SourceMapChunk:             SourceMapChunk{p.sourceMap, p.prevState, len(p.js) - p.prevLineStart},
+	}
 }
 
-func PrintExpr(expr ast.Expr, symbols *ast.SymbolMap, requireRef ast.Ref, options Options) ([]byte, SourceMapChunk) {
-	p := createPrinter(symbols, make(map[ast.Ref]bool), requireRef, options)
+func PrintExpr(expr ast.Expr, symbols *ast.SymbolMap, options PrintOptions) PrintResult {
+	p := createPrinter(symbols, options)
 
 	// Always add a mapping at the beginning of the file
 	p.addSourceMapping(ast.Loc{0})
 
 	p.printExpr(expr, ast.LLowest, 0)
-	return p.js, SourceMapChunk{p.sourceMap, p.prevState, len(p.js) - p.prevLineStart}
+	return PrintResult{
+		JS:                         p.js,
+		JSWithoutTrailingSemicolon: p.js,
+		SourceMapChunk:             SourceMapChunk{p.sourceMap, p.prevState, len(p.js) - p.prevLineStart},
+	}
 }

@@ -74,7 +74,7 @@ const (
 	UnOpCpl
 	UnOpNot
 	UnOpVoid
-	UnOpTypeOf
+	UnOpTypeof
 	UnOpDelete
 
 	// Prefix update
@@ -97,7 +97,7 @@ const (
 	BinOpGt
 	BinOpGe
 	BinOpIn
-	BinOpInstanceOf
+	BinOpInstanceof
 	BinOpShl
 	BinOpShr
 	BinOpUShr
@@ -211,6 +211,10 @@ type Range struct {
 	Len int32
 }
 
+func (r Range) End() int32 {
+	return r.Loc.Start + r.Len
+}
+
 type LocRef struct {
 	Loc Loc
 	Ref Ref
@@ -261,6 +265,9 @@ type PropertyBinding struct {
 }
 
 type Arg struct {
+	// "constructor(public x: boolean) {}"
+	IsTypeScriptCtorField bool
+
 	Binding Binding
 	Default *Expr
 }
@@ -355,6 +362,7 @@ type ECall struct {
 	Target          Expr
 	Args            []Expr
 	IsOptionalChain bool
+	IsParenthesized bool
 }
 
 type EDot struct {
@@ -362,12 +370,14 @@ type EDot struct {
 	Name            string
 	NameLoc         Loc
 	IsOptionalChain bool
+	IsParenthesized bool
 }
 
 type EIndex struct {
 	Target          Expr
 	Index           Expr
 	IsOptionalChain bool
+	IsParenthesized bool
 }
 
 type EArrow struct {
@@ -384,10 +394,27 @@ type EClass struct{ Class Class }
 
 type EIdentifier struct{ Ref Ref }
 
-type ENamespaceImport struct {
-	NamespaceRef Ref
-	ItemRef      Ref
-	Alias        string
+// This is similar to an EIdentifier but it represents a reference to an ES6
+// import item.
+//
+// Depending on how the code is linked, the file containing this EImportIdentifier
+// may or may not be in the same module group as the file it was imported from.
+//
+// If it's the same module group than we can just merge the import item symbol
+// with the corresponding symbol that was imported, effectively renaming them
+// to be the same thing and statically binding them together.
+//
+// But if it's a different module group, then the import must be dynamically
+// evaluated using a property access off the corresponding namespace symbol,
+// which represents the result of a require() call.
+//
+// It's stored as a separate type so it's not easy to confuse with a plain
+// identifier. For example, it'd be bad if code trying to convert "{x: x}" into
+// "{x}" shorthand syntax wasn't aware that the "x" in this case is actually
+// "{x: importedNamespace.x}". This separate type forces code to opt-in to
+// doing this instead of opt-out.
+type EImportIdentifier struct {
+	Ref Ref
 }
 
 type EJSXElement struct {
@@ -444,42 +471,54 @@ type ERequire struct {
 }
 
 type EImport struct {
-	Path Path
+	Expr Expr
 }
 
-func (*EArray) isExpr()           {}
-func (*EUnary) isExpr()           {}
-func (*EBinary) isExpr()          {}
-func (*EBoolean) isExpr()         {}
-func (*ESuper) isExpr()           {}
-func (*ENull) isExpr()            {}
-func (*EUndefined) isExpr()       {}
-func (*EThis) isExpr()            {}
-func (*ENew) isExpr()             {}
-func (*ENewTarget) isExpr()       {}
-func (*EImportMeta) isExpr()      {}
-func (*ECall) isExpr()            {}
-func (*EDot) isExpr()             {}
-func (*EIndex) isExpr()           {}
-func (*EArrow) isExpr()           {}
-func (*EFunction) isExpr()        {}
-func (*EClass) isExpr()           {}
-func (*EIdentifier) isExpr()      {}
-func (*ENamespaceImport) isExpr() {}
-func (*EJSXElement) isExpr()      {}
-func (*EMissing) isExpr()         {}
-func (*ENumber) isExpr()          {}
-func (*EBigInt) isExpr()          {}
-func (*EObject) isExpr()          {}
-func (*ESpread) isExpr()          {}
-func (*EString) isExpr()          {}
-func (*ETemplate) isExpr()        {}
-func (*ERegExp) isExpr()          {}
-func (*EAwait) isExpr()           {}
-func (*EYield) isExpr()           {}
-func (*EIf) isExpr()              {}
-func (*ERequire) isExpr()         {}
-func (*EImport) isExpr()          {}
+func (*EArray) isExpr()            {}
+func (*EUnary) isExpr()            {}
+func (*EBinary) isExpr()           {}
+func (*EBoolean) isExpr()          {}
+func (*ESuper) isExpr()            {}
+func (*ENull) isExpr()             {}
+func (*EUndefined) isExpr()        {}
+func (*EThis) isExpr()             {}
+func (*ENew) isExpr()              {}
+func (*ENewTarget) isExpr()        {}
+func (*EImportMeta) isExpr()       {}
+func (*ECall) isExpr()             {}
+func (*EDot) isExpr()              {}
+func (*EIndex) isExpr()            {}
+func (*EArrow) isExpr()            {}
+func (*EFunction) isExpr()         {}
+func (*EClass) isExpr()            {}
+func (*EIdentifier) isExpr()       {}
+func (*EImportIdentifier) isExpr() {}
+func (*EJSXElement) isExpr()       {}
+func (*EMissing) isExpr()          {}
+func (*ENumber) isExpr()           {}
+func (*EBigInt) isExpr()           {}
+func (*EObject) isExpr()           {}
+func (*ESpread) isExpr()           {}
+func (*EString) isExpr()           {}
+func (*ETemplate) isExpr()         {}
+func (*ERegExp) isExpr()           {}
+func (*EAwait) isExpr()            {}
+func (*EYield) isExpr()            {}
+func (*EIf) isExpr()               {}
+func (*ERequire) isExpr()          {}
+func (*EImport) isExpr()           {}
+
+func JoinWithComma(a Expr, b Expr) Expr {
+	return Expr{a.Loc, &EBinary{BinOpComma, a, b}}
+}
+
+func JoinAllWithComma(all []Expr) Expr {
+	result := all[0]
+	for _, value := range all[1:] {
+		result = JoinWithComma(result, value)
+	}
+	return result
+}
 
 type ExprOrStmt struct {
 	Expr *Expr
@@ -499,12 +538,10 @@ type SBlock struct {
 	Stmts []Stmt
 }
 
-type SConst struct {
-	Decls    []Decl
-	IsExport bool
-}
-
 type SEmpty struct{}
+
+// This is a stand-in for a TypeScript type declaration
+type STypeScript struct{}
 
 type SDebugger struct{}
 
@@ -532,8 +569,34 @@ type SExportStar struct {
 	Path Path
 }
 
+// This is an "export = value;" statement in TypeScript
+type SExportEquals struct {
+	Value Expr
+}
+
 type SExpr struct {
 	Value Expr
+}
+
+type EnumValue struct {
+	Loc   Loc
+	Ref   Ref
+	Name  []uint16
+	Value *Expr
+}
+
+type SEnum struct {
+	Name     LocRef
+	Arg      Ref
+	Values   []EnumValue
+	IsExport bool
+}
+
+type SNamespace struct {
+	Name     LocRef
+	Arg      Ref
+	Stmts    []Stmt
+	IsExport bool
 }
 
 type SFunction struct {
@@ -593,14 +656,20 @@ type SWith struct {
 }
 
 type Catch struct {
+	Loc     Loc
 	Binding *Binding
 	Body    []Stmt
+}
+
+type Finally struct {
+	Loc   Loc
+	Stmts []Stmt
 }
 
 type STry struct {
 	Body    []Stmt
 	Catch   *Catch
-	Finally *[]Stmt
+	Finally *Finally
 }
 
 type Case struct {
@@ -638,11 +707,6 @@ type SImport struct {
 	Path        Path
 }
 
-type SLet struct {
-	Decls    []Decl
-	IsExport bool
-}
-
 type SReturn struct {
 	Value *Expr
 }
@@ -651,9 +715,22 @@ type SThrow struct {
 	Value Expr
 }
 
-type SVar struct {
+type LocalKind uint8
+
+const (
+	LocalVar LocalKind = iota
+	LocalLet
+	LocalConst
+)
+
+type SLocal struct {
 	Decls    []Decl
+	Kind     LocalKind
 	IsExport bool
+
+	// The TypeScript compiler doesn't generate code for "import foo = bar"
+	// statements inside namespaces where the import is never used.
+	WasTSImportEqualsInNamespace bool
 }
 
 type SBreak struct {
@@ -665,15 +742,18 @@ type SContinue struct {
 }
 
 func (*SBlock) isStmt()         {}
-func (*SConst) isStmt()         {}
 func (*SDebugger) isStmt()      {}
 func (*SDirective) isStmt()     {}
 func (*SEmpty) isStmt()         {}
+func (*STypeScript) isStmt()    {}
 func (*SExportClause) isStmt()  {}
 func (*SExportFrom) isStmt()    {}
 func (*SExportDefault) isStmt() {}
 func (*SExportStar) isStmt()    {}
+func (*SExportEquals) isStmt()  {}
 func (*SExpr) isStmt()          {}
+func (*SEnum) isStmt()          {}
+func (*SNamespace) isStmt()     {}
 func (*SFunction) isStmt()      {}
 func (*SClass) isStmt()         {}
 func (*SLabel) isStmt()         {}
@@ -687,12 +767,22 @@ func (*SWith) isStmt()          {}
 func (*STry) isStmt()           {}
 func (*SSwitch) isStmt()        {}
 func (*SImport) isStmt()        {}
-func (*SLet) isStmt()           {}
 func (*SReturn) isStmt()        {}
 func (*SThrow) isStmt()         {}
-func (*SVar) isStmt()           {}
+func (*SLocal) isStmt()         {}
 func (*SBreak) isStmt()         {}
 func (*SContinue) isStmt()      {}
+
+func IsSuperCall(stmt Stmt) bool {
+	if expr, ok := stmt.Data.(*SExpr); ok {
+		if call, ok := expr.Value.Data.(*ECall); ok {
+			if _, ok := call.Target.Data.(*ESuper); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 type ClauseItem struct {
 	Alias    string
@@ -722,6 +812,7 @@ const (
 	// - Variables declared using "var"
 	//
 	SymbolHoisted
+	SymbolHoistedFunction
 
 	// There's a weird special case where catch variables declared using a simple
 	// identifier (i.e. not a binding pattern) block hoisted variables instead of
@@ -743,9 +834,28 @@ const (
 	// This symbol is for handling this weird special case.
 	SymbolCatchIdentifier
 
+	// Classes can merge with TypeScript namespaces.
+	SymbolClass
+
+	// TypeScript enums can merge with TypeScript namespaces and other TypeScript
+	// enums.
+	SymbolTSEnum
+
+	// TypeScript namespaces can merge with classes, functions, TypeScript enums,
+	// and other TypeScript namespaces.
+	SymbolTSNamespace
+
+	// In TypeScript, imports are allowed to silently collide with symbols within
+	// the module. Presumably this is because the imports may be type-only.
+	SymbolTSImport
+
 	// This annotates all other symbols that don't have special behavior.
 	SymbolOther
 )
+
+func (kind SymbolKind) IsHoisted() bool {
+	return kind == SymbolHoisted || kind == SymbolHoistedFunction
+}
 
 var InvalidRef Ref = Ref{^uint32(0), ^uint32(0)}
 
@@ -782,6 +892,24 @@ type Symbol struct {
 	// an invalid ref if it's the last link. If this isn't invalid, you need to
 	// FollowSymbols to get the real one.
 	Link Ref
+
+	// This is used for symbols that represent items in the import clause of an
+	// ES6 import statement. These should always be referenced by EImportIdentifier
+	// instead of an EIdentifier. When this is present, the expression should
+	// be printed as a property access off the namespace instead of as a bare
+	// identifier.
+	//
+	// For correctness, this must be stored on the symbol instead of indirectly
+	// associated with the Ref for the symbol somehow. In ES6 "flat bundling"
+	// mode, re-exported symbols are collapsed using MergeSymbols() and renamed
+	// symbols from other files that end up at this symbol must be able to tell
+	// if it has a namespace alias.
+	NamespaceAlias *NamespaceAlias
+}
+
+type NamespaceAlias struct {
+	NamespaceRef Ref
+	Alias        string
 }
 
 type ScopeKind int
@@ -789,10 +917,9 @@ type ScopeKind int
 const (
 	ScopeBlock ScopeKind = iota
 	ScopeLabel
-	ScopeFunction
+	ScopeEntry // This is a module, function, or namespace
 	ScopeFunctionName
 	ScopeClassName
-	ScopeModule
 )
 
 type Scope struct {
@@ -802,9 +929,8 @@ type Scope struct {
 	Members   map[string]Ref
 	Generated []Ref
 
-	// This is the ref of the scope itself. This is currently only used to store
-	// the ref of the label symbol for ScopeLabel scopes.
-	ScopeRef Ref
+	// This is used to store the ref of the label symbol for ScopeLabel scopes.
+	LabelRef Ref
 }
 
 type SymbolMap struct {
@@ -828,6 +954,10 @@ func (sm *SymbolMap) Get(ref Ref) Symbol {
 
 func (sm *SymbolMap) IncrementUseCountEstimate(ref Ref) {
 	sm.Outer[ref.OuterIndex][ref.InnerIndex].UseCountEstimate++
+}
+
+func (sm *SymbolMap) SetNamespaceAlias(ref Ref, alias NamespaceAlias) {
+	sm.Outer[ref.OuterIndex][ref.InnerIndex].NamespaceAlias = &alias
 }
 
 // The symbol must already exist to call this
@@ -861,24 +991,21 @@ type ImportPath struct {
 }
 
 type AST struct {
-	ImportPaths []ImportPath
-
-	// ENamespaceImport items in this map are printed as an indirect access off
-	// of the namespace. This is a way for the bundler to pass this information
-	// to the printer. This is necessary when using a namespace import or when
-	// an import item must be converted to a property access off a require() call.
-	IndirectImportItems map[Ref]bool
+	ImportPaths   []ImportPath
+	WasTypeScript bool
 
 	// This is true if something used the "exports" or "module" variables, which
-	// means they could have exported something. This is used to silence errors
-	// about mismatched exports.
-	HasCommonJsExports bool
+	// means they could have exported something. It's also true if the file
+	// contains a top-level return statement. When a file uses CommonJS features,
+	// it's not a candidate for "flat bundling" and must be wrapped in its own
+	// closure.
+	UsesCommonJSFeatures bool
 
+	Hashbang    string
 	Stmts       []Stmt
 	Symbols     *SymbolMap
 	ModuleScope *Scope
 	ExportsRef  Ref
-	RequireRef  Ref
 	ModuleRef   Ref
 }
 

@@ -52,7 +52,7 @@ func expectPrinted(t *testing.T, contents string, expected string) {
 		if !ok {
 			t.Fatal("Parse error")
 		}
-		js, _ := printer.Print(ast, printer.Options{})
+		js := printer.Print(ast, printer.PrintOptions{}).JS
 		assertEqual(t, string(js), expected)
 	})
 }
@@ -77,7 +77,7 @@ func expectPrintedMangle(t *testing.T, contents string, expected string) {
 		if !ok {
 			t.Fatal("Parse error")
 		}
-		js, _ := printer.Print(ast, printer.Options{})
+		js := printer.Print(ast, printer.PrintOptions{}).JS
 		assertEqual(t, string(js), expected)
 	})
 }
@@ -103,7 +103,7 @@ func expectPrintedTarget(t *testing.T, target LanguageTarget, contents string, e
 		if !ok {
 			t.Fatal("Parse error")
 		}
-		js, _ := printer.Print(ast, printer.Options{})
+		js := printer.Print(ast, printer.PrintOptions{}).JS
 		assertEqual(t, string(js), expected)
 	})
 }
@@ -152,7 +152,7 @@ func expectPrintedJSX(t *testing.T, contents string, expected string) {
 		if !ok {
 			t.Fatal("Parse error")
 		}
-		js, _ := printer.Print(ast, printer.Options{})
+		js := printer.Print(ast, printer.PrintOptions{}).JS
 		assertEqual(t, string(js), expected)
 	})
 }
@@ -418,6 +418,7 @@ func TestASI(t *testing.T) {
 	expectPrinted(t, "0\n(1)", "0(1);\n")
 	expectPrinted(t, "new x\n(1)", "new x(1);\n")
 	expectPrinted(t, "while (true) break\nx", "while (true)\n  break;\nx;\n")
+	expectPrinted(t, "x\n!y", "x;\n!y;\n")
 
 	expectPrinted(t, "function* foo(){yield\na}", "function* foo() {\n  yield;\n  a;\n}\n")
 	expectParseError(t, "function* foo(){yield\n*a}", "<stdin>: error: Unexpected \"*\"\n")
@@ -448,9 +449,14 @@ func TestPattern(t *testing.T) {
 }
 
 func TestIndex(t *testing.T) {
-	expectParseError(t, "a[b, c]", "<stdin>: warning: Use of \",\" inside a property access is misleading because JavaScript doesn't have multidimensional arrays\n")
-	expectParseError(t, "a\n[b, c]", "<stdin>: warning: Use of \",\" inside a property access is misleading because JavaScript doesn't have multidimensional arrays\n")
+	warning := "<stdin>: warning: Use of \",\" inside a property access is " +
+		"misleading because JavaScript doesn't have multidimensional arrays\n"
+	expectParseError(t, "a[b, c]", warning)
+	expectParseError(t, "a[b, c, d]", warning+warning)
+	expectParseError(t, "a\n[b, c]", warning)
+	expectParseError(t, "a\n[b, c, d]", warning+warning)
 	expectPrinted(t, "a[(b, c)]", "a[b, c];\n")
+	expectPrinted(t, "a[(b, c, d)]", "a[b, c, d];\n")
 }
 
 func TestObject(t *testing.T) {
@@ -648,6 +654,7 @@ func TestTemplate(t *testing.T) {
 
 func TestSwitch(t *testing.T) {
 	expectPrinted(t, "switch (x) { default: }", "switch (x) {\n  default:\n}\n")
+	expectPrinted(t, "switch ((x => x + 1)(0)) { case 1: var y } y = 2", "switch (((x) => x + 1)(0)) {\n  case 1:\n    var y;\n}\ny = 2;\n")
 	expectParseError(t, "switch (x) { default: default: }", "<stdin>: error: Multiple default clauses are not allowed\n")
 }
 
@@ -760,6 +767,7 @@ func TestConstantFolding(t *testing.T) {
 	expectPrinted(t, "x + 'a' + 'bc'", "x + \"abc\";\n")
 	expectPrinted(t, "x + 'ab' + 'c'", "x + \"abc\";\n")
 	expectPrinted(t, "'a' + 1", "\"a\" + 1;\n")
+	expectPrinted(t, "x * 'a' + 'b'", "x * \"a\" + \"b\";\n")
 
 	expectPrinted(t, "'string' + `template`", "`stringtemplate`;\n")
 	expectPrinted(t, "'string' + `a${foo}b`", "`stringa${foo}b`;\n")
@@ -796,6 +804,17 @@ func TestConstantFolding(t *testing.T) {
 	expectPrinted(t, "123n === 1_2_3n", "true;\n")
 }
 
+func TestConstantFoldingScopes(t *testing.T) {
+	// Parsing will crash if somehow the scope traversal is misaligned between
+	// the parsing and binding passes. This checks for those cases.
+	expectPrinted(t, "1 ? 0 : ()=>{}; (()=>{})()", "0;\n(() => {\n})();\n")
+	expectPrinted(t, "0 ? ()=>{} : 1; (()=>{})()", "1;\n(() => {\n})();\n")
+	expectPrinted(t, "0 && (()=>{}); (()=>{})()", "0;\n(() => {\n})();\n")
+	expectPrinted(t, "1 || (()=>{}); (()=>{})()", "1;\n(() => {\n})();\n")
+	expectPrintedMangle(t, "if (1) 0; else ()=>{}; (()=>{})()", "(() => {\n})();\n")
+	expectPrintedMangle(t, "if (0) ()=>{}; else 1; (()=>{})()", "(() => {\n})();\n")
+}
+
 func TestImport(t *testing.T) {
 	expectPrinted(t, "import \"foo\"", "import \"foo\";\n")
 	expectPrinted(t, "import {} from \"foo\"", "import {} from \"foo\";\n")
@@ -812,6 +831,7 @@ func TestImport(t *testing.T) {
 
 	expectPrinted(t, "import('foo')", "import(\"foo\");\n")
 	expectPrinted(t, "(import('foo'))", "import(\"foo\");\n")
+	expectPrinted(t, "{import('foo')}", "{\n  import(\"foo\");\n}\n")
 	expectPrinted(t, "import('foo').then(() => {})", "import(\"foo\").then(() => {\n});\n")
 	expectParseError(t, "import()", "<stdin>: error: Unexpected \")\"\n")
 	expectParseError(t, "import(...a)", "<stdin>: error: Unexpected \"...\"\n")
@@ -819,6 +839,7 @@ func TestImport(t *testing.T) {
 
 	expectPrinted(t, "import.meta", "import.meta;\n")
 	expectPrinted(t, "(import.meta)", "import.meta;\n")
+	expectPrinted(t, "{import.meta}", "{\n  import.meta;\n}\n")
 }
 
 func TestExport(t *testing.T) {
@@ -874,6 +895,14 @@ func TestExportDefault(t *testing.T) {
 	expectParseError(t, "export default 1, 2", "<stdin>: error: Expected \";\" but found \",\"\n")
 	expectPrinted(t, "export default (1, 2)", "export default (1, 2);\n")
 
+	expectParseError(t, "export default async, 0", "<stdin>: error: Expected \";\" but found \",\"\n")
+	expectPrinted(t, "export default async", "export default async;\n")
+	expectPrinted(t, "export default async()", "export default async();\n")
+	expectPrinted(t, "export default async + 1", "export default async + 1;\n")
+	expectPrinted(t, "export default async => {}", "export default (async) => {\n};\n")
+	expectPrinted(t, "export default async x => {}", "export default async (x) => {\n};\n")
+	expectPrinted(t, "export default async () => {}", "export default async () => {\n};\n")
+
 	// This is a corner case in the ES6 grammar. The "export default" statement
 	// normally takes an expression except for the function and class keywords
 	// which behave sort of like their respective declarations instead.
@@ -907,6 +936,8 @@ func TestCatch(t *testing.T) {
 	expectPrinted(t, "try {} catch (e) { function e() {} }", "try {\n} catch (e) {\n  function e() {\n  }\n}\n")
 	expectPrinted(t, "var e; try {} catch (e) {}", "var e;\ntry {\n} catch (e) {\n}\n")
 	expectPrinted(t, "let e; try {} catch (e) {}", "let e;\ntry {\n} catch (e) {\n}\n")
+	expectPrinted(t, "try { var e } catch (e) {}", "try {\n  var e;\n} catch (e) {\n}\n")
+	expectPrinted(t, "try { function e() {} } catch (e) {}", "try {\n  function e() {\n  }\n} catch (e) {\n}\n")
 
 	expectParseError(t, "try {} catch ({e}) { var e }", "<stdin>: error: \"e\" has already been declared\n")
 	expectParseError(t, "try {} catch ({e}) { function e() {} }", "<stdin>: error: \"e\" has already been declared\n")
@@ -1275,4 +1306,94 @@ func TestLowerClassStatic(t *testing.T) {
 	expectPrintedTarget(t, ES2015, "(class {})", "(class {\n});\n")
 	expectPrintedTarget(t, ES2015, "class Foo {}", "class Foo {\n}\n")
 	expectPrintedTarget(t, ES2015, "(class Foo {})", "(class Foo {\n});\n")
+}
+
+func TestLowerOptionalChain(t *testing.T) {
+	expectPrintedTarget(t, ES2019, "a?.b.c", "a == null ? void 0 : a.b.c;\n")
+	expectPrintedTarget(t, ES2019, "(a?.b).c", "(a == null ? void 0 : a.b).c;\n")
+	expectPrintedTarget(t, ES2019, "a.b?.c", "var _a;\n(_a = a.b) == null ? void 0 : _a.c;\n")
+	expectPrintedTarget(t, ES2019, "this?.x", "this == null ? void 0 : this.x;\n")
+
+	expectPrintedTarget(t, ES2019, "a?.[b][c]", "a == null ? void 0 : a[b][c];\n")
+	expectPrintedTarget(t, ES2019, "(a?.[b])[c]", "(a == null ? void 0 : a[b])[c];\n")
+	expectPrintedTarget(t, ES2019, "a[b]?.[c]", "var _a;\n(_a = a[b]) == null ? void 0 : _a[c];\n")
+	expectPrintedTarget(t, ES2019, "this?.[x]", "this == null ? void 0 : this[x];\n")
+
+	expectPrintedTarget(t, ES2019, "a?.(b)(c)", "a == null ? void 0 : a(b)(c);\n")
+	expectPrintedTarget(t, ES2019, "(a?.(b))(c)", "(a == null ? void 0 : a(b))(c);\n")
+	expectPrintedTarget(t, ES2019, "a(b)?.(c)", "var _a;\n(_a = a(b)) == null ? void 0 : _a(c);\n")
+	expectPrintedTarget(t, ES2019, "this?.(x)", "this == null ? void 0 : this(x);\n")
+
+	expectPrintedTarget(t, ES2019, "delete a?.b.c", "a == null ? true : delete a.b.c;\n")
+	expectPrintedTarget(t, ES2019, "delete a?.[b][c]", "a == null ? true : delete a[b][c];\n")
+	expectPrintedTarget(t, ES2019, "delete a?.(b)(c)", "a == null ? true : delete a(b)(c);\n")
+
+	expectPrintedTarget(t, ES2019, "delete (a?.b).c", "delete (a == null ? void 0 : a.b).c;\n")
+	expectPrintedTarget(t, ES2019, "delete (a?.[b])[c]", "delete (a == null ? void 0 : a[b])[c];\n")
+	expectPrintedTarget(t, ES2019, "delete (a?.(b))(c)", "delete (a == null ? void 0 : a(b))(c);\n")
+
+	expectPrintedTarget(t, ES2019, "(delete a?.b).c", "(a == null ? true : delete a.b).c;\n")
+	expectPrintedTarget(t, ES2019, "(delete a?.[b])[c]", "(a == null ? true : delete a[b])[c];\n")
+	expectPrintedTarget(t, ES2019, "(delete a?.(b))(c)", "(a == null ? true : delete a(b))(c);\n")
+
+	expectPrintedTarget(t, ES2019, "null?.x", "void 0;\n")
+	expectPrintedTarget(t, ES2019, "null?.[x]", "void 0;\n")
+	expectPrintedTarget(t, ES2019, "null?.(x)", "void 0;\n")
+
+	expectPrintedTarget(t, ES2019, "delete null?.x", "true;\n")
+	expectPrintedTarget(t, ES2019, "delete null?.[x]", "true;\n")
+	expectPrintedTarget(t, ES2019, "delete null?.(x)", "true;\n")
+
+	expectPrintedTarget(t, ES2019, "undefined?.x", "void 0;\n")
+	expectPrintedTarget(t, ES2019, "undefined?.[x]", "void 0;\n")
+	expectPrintedTarget(t, ES2019, "undefined?.(x)", "void 0;\n")
+
+	expectPrintedTarget(t, ES2019, "delete undefined?.x", "true;\n")
+	expectPrintedTarget(t, ES2019, "delete undefined?.[x]", "true;\n")
+	expectPrintedTarget(t, ES2019, "delete undefined?.(x)", "true;\n")
+
+	expectPrintedTarget(t, ES2020, "x?.y", "x?.y;\n")
+	expectPrintedTarget(t, ES2020, "x?.[y]", "x?.[y];\n")
+	expectPrintedTarget(t, ES2020, "x?.(y)", "x?.(y);\n")
+
+	expectPrintedTarget(t, ES2020, "null?.x", "null?.x;\n")
+	expectPrintedTarget(t, ES2020, "null?.[x]", "null?.[x];\n")
+	expectPrintedTarget(t, ES2020, "null?.(x)", "null?.(x);\n")
+
+	expectPrintedTarget(t, ES2020, "undefined?.x", "(void 0)?.x;\n")
+	expectPrintedTarget(t, ES2020, "undefined?.[x]", "(void 0)?.[x];\n")
+	expectPrintedTarget(t, ES2020, "undefined?.(x)", "(void 0)?.(x);\n")
+
+	// Check multiple levels of nesting
+	expectPrintedTarget(t, ES2019, "a?.b?.c?.d", `var _a, _b;
+(_b = (_a = a == null ? void 0 : a.b) == null ? void 0 : _a.c) == null ? void 0 : _b.d;
+`)
+	expectPrintedTarget(t, ES2019, "a?.[b]?.[c]?.[d]", `var _a, _b;
+(_b = (_a = a == null ? void 0 : a[b]) == null ? void 0 : _a[c]) == null ? void 0 : _b[d];
+`)
+	expectPrintedTarget(t, ES2019, "a?.(b)?.(c)?.(d)", `var _a, _b;
+(_b = (_a = a == null ? void 0 : a(b)) == null ? void 0 : _a(c)) == null ? void 0 : _b(d);
+`)
+
+	// Check the need to use ".call()"
+	expectPrintedTarget(t, ES2019, "a.b?.(c)", `var _a;
+(_a = a.b) == null ? void 0 : _a.call(a, c);
+`)
+	expectPrintedTarget(t, ES2019, "a[b]?.(c)", `var _a;
+(_a = a[b]) == null ? void 0 : _a.call(a, c);
+`)
+	expectPrintedTarget(t, ES2019, "a?.[b]?.(c)", `var _a;
+(_a = a == null ? void 0 : a[b]) == null ? void 0 : _a.call(a, c);
+`)
+	expectPrintedTarget(t, ES2019, "a?.[b][c]?.(d)", `var _a, _b;
+(_b = a == null ? void 0 : (_a = a[b])[c]) == null ? void 0 : _b.call(_a, d);
+`)
+	expectPrintedTarget(t, ES2019, "a[b][c]?.(d)", `var _a, _b;
+(_b = (_a = a[b])[c]) == null ? void 0 : _b.call(_a, d);
+`)
+}
+
+func TestLowerOptionalCatchBinding(t *testing.T) {
+	expectPrintedTarget(t, ES2019, "try {} catch {}", "try {\n} catch {\n}\n")
+	expectPrintedTarget(t, ES2018, "try {} catch {}", "try {\n} catch (e) {\n}\n")
 }
